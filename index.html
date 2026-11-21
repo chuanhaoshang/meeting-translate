@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="会议翻译">
+<title>会议翻译</title>
+<style>
+  :root { --bg:#fff; --fg:#111; --muted:#888; --card:#f3f4f6; --accent:#2563eb; --stop:#dc2626; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#000; --fg:#eee; --muted:#888; --card:#1c1c1e; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px -apple-system, system-ui, sans-serif;
+         display:flex; flex-direction:column; height:100dvh; padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+  header { display:flex; gap:8px; padding:8px 12px; align-items:center; }
+  header select, header input { font-size:16px; padding:6px; border-radius:8px; border:1px solid var(--muted); background:var(--card); color:var(--fg); }
+  header input { flex:1; min-width:0; }
+  #log { flex:1; overflow-y:auto; padding:8px 12px; }
+  .pair { background:var(--card); border-radius:12px; padding:10px 12px; margin-bottom:8px; }
+  .src { color:var(--muted); font-size:14px; }
+  .dst { font-size:19px; margin-top:4px; line-height:1.4; }
+  #interim { color:var(--muted); font-style:italic; min-height:1.4em; padding:0 12px; }
+  #status { color:var(--muted); font-size:13px; padding:0 12px; }
+  #btn { margin:8px 12px 12px; padding:16px; font-size:18px; border:0; border-radius:14px; color:#fff; background:var(--accent); }
+  #btn.on { background:var(--stop); }
+</style>
+</head>
+<body>
+<header>
+  <select id="lang" aria-label="会议语言">
+    <option value="en-US">英→中</option>
+    <option value="zh-CN">中→英</option>
+  </select>
+  <input id="key" type="password" placeholder="DeepSeek API Key" autocomplete="off" aria-label="DeepSeek API Key">
+</header>
+<div id="log"></div>
+<div id="interim"></div>
+<div id="status"></div>
+<button id="btn">开始</button>
+
+<script>
+const $ = id => document.getElementById(id);
+const store = { get: k => { try { return localStorage.getItem(k) || ''; } catch { return ''; } },
+                set: (k, v) => { try { localStorage.setItem(k, v); } catch {} } };
+$('key').value = store.get('ds_key');
+$('lang').value = store.get('lang') || 'en-US';
+$('key').onchange = () => store.set('ds_key', $('key').value.trim());
+$('lang').onchange = () => store.set('lang', $('lang').value);
+
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+if (!SR) $('status').textContent = '此浏览器不支持语音识别，请用 iPhone Safari 或 Chrome';
+
+let rec, running = false, pendingText = '', silenceTimer, wakeLock;
+const history = []; // last few source sentences, as context for the LLM
+
+async function translate(text) {
+  const toZh = $('lang').value === 'en-US';
+  const el = document.createElement('div');
+  el.className = 'pair';
+  el.innerHTML = '<div class="src"></div><div class="dst">…</div>';
+  el.querySelector('.src').textContent = text;
+  const dst = el.querySelector('.dst');
+  $('log').appendChild(el);
+  $('log').scrollTop = $('log').scrollHeight;
+
+  const context = history.slice(-3).join('\n');
+  history.push(text);
+  try {
+    const res = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + $('key').value.trim() },
+      body: JSON.stringify({
+        model: 'deepseek-chat', stream: true, temperature: 0.2,
+        messages: [
+          { role: 'system', content: `你是会议同声传译。把用户给的语音识别文本翻译成${toZh ? '简体中文' : '英文'}。识别文本可能有错字或断句不全，按上下文合理理解。只输出译文，不要解释。` +
+              (context ? `\n前文（仅供参考，不要翻译）：\n${context}` : '') },
+          { role: 'user', content: text }
+        ]
+      })
+    });
+    if (!res.ok) throw new Error(res.status + ' ' + (await res.text()).slice(0, 200));
+    dst.textContent = '';
+    const reader = res.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split('\n'); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
+        dst.textContent += JSON.parse(line.slice(6)).choices[0]?.delta?.content || '';
+      }
+      $('log').scrollTop = $('log').scrollHeight;
+    }
+  } catch (e) {
+    dst.textContent = '翻译失败：' + e.message;
+  }
+}
+
+function flush() {
+  const t = pendingText.trim();
+  pendingText = ''; $('interim').textContent = '';
+  if (t) translate(t);
+}
+
+function startRec() {
+  rec = new SR();
+  rec.lang = $('lang').value;
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.onresult = e => {
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) { pendingText = r[0].transcript; flush(); } // replaces the interim of the same sentence
+      else interim += r[0].transcript;
+    }
+    // iOS Safari rarely marks results final in continuous mode, so treat a 1.2s pause as end of sentence
+    if (interim) {
+      pendingText = interim; $('interim').textContent = interim;
+      clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(() => rec.stop(), 1200);
+    }
+  };
+  rec.onerror = e => { $('status').textContent = '识别错误：' + e.error; if (e.error === 'not-allowed') stop(); };
+  // iOS ends sessions on its own; restart until the user taps stop.
+  // shortcut: ~0.3s of audio is lost on each restart, upgrade to a streaming ASR API if that matters
+  rec.onend = () => { clearTimeout(silenceTimer); flush(); if (running) try { startRec(); } catch {} };
+  rec.start();
+}
+
+async function start() {
+  if (!$('key').value.trim()) { $('status').textContent = '先填 DeepSeek API Key'; return; }
+  running = true; $('btn').textContent = '停止'; $('btn').classList.add('on'); $('status').textContent = '正在听…';
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+  startRec();
+}
+
+function stop() {
+  running = false; $('btn').textContent = '开始'; $('btn').classList.remove('on'); $('status').textContent = '';
+  try { rec?.stop(); } catch {}
+  wakeLock?.release(); wakeLock = null;
+}
+
+$('btn').onclick = () => SR && (running ? stop() : start());
+// iOS drops the wake lock when the page is hidden; re-acquire on return
+document.addEventListener('visibilitychange', async () => {
+  if (running && document.visibilityState === 'visible') try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+});
+</script>
+</body>
+</html>
